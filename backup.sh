@@ -302,4 +302,5 @@ fi
 # Initial setup and main loop
 check_dependencies
 load_config
+
 main_menu
