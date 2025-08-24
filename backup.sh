@@ -1,10 +1,9 @@
 #!/bin/bash
 
-# Marzban Remote Backup Manager (MRBM)
-# A professional Bash menu script for backing up Marzban servers and their databases,
-# with automatic execution and sending backups to Telegram.
+# Marzban Remote Backup Manager (MRBM)-AmirTN
+# Core script for managing backups.
 
-# Set strict mode
+# Set strict mode for robustness
 set -e
 set -o pipefail
 
@@ -12,31 +11,14 @@ set -o pipefail
 CONFIG_FILE="config.env"
 BACKUP_DIR="backups"
 LOG_FILE="backup.log"
-# The number of days to keep backups
 RETENTION_DAYS=7
 
 # --- Functions ---
-
-# Check for required dependencies
-check_dependencies() {
-    local deps=("tar" "curl" "sshpass" "find")
-    local missing=0
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            echo "Error: Required dependency '$dep' not found. Please install it." >&2
-            missing=1
-        fi
-    done
-    if [ "$missing" -eq 1 ]; then
-        exit 1
-    fi
-}
 
 # Load and save server configurations
 load_config() {
     declare -gA SERVERS
     if [[ -f "$CONFIG_FILE" ]]; then
-        # Check if the config file has proper permissions
         if [[ $(stat -c "%a" "$CONFIG_FILE") -ne 600 ]]; then
             echo "Warning: Changing permissions of $CONFIG_FILE to 600 for security."
             chmod 600 "$CONFIG_FILE"
@@ -59,7 +41,6 @@ save_config() {
         echo "SERVERS[\"$key\"]=\"${SERVERS[$key]}\"" >> "$CONFIG_FILE.tmp"
     done
     
-    # Save last backup timestamps
     for var_name in "${!LAST_BACKUP_@}"; do
         echo "$var_name=\"${!var_name}\"" >> "$CONFIG_FILE.tmp"
     done
@@ -84,6 +65,7 @@ add_server() {
     read -p "SSH Username (default root): " username
     username=${username:-root}
     
+    echo "Warning: Using a password is not secure. Use an SSH key if possible."
     read -s -p "SSH Password (leave blank for key): " password
     echo
     if [[ -z "$password" ]]; then
@@ -99,7 +81,6 @@ add_server() {
     read -p "Telegram Bot Token: " bot_token
     read -p "Telegram Chat ID: " chat_id
 
-    # Combine all details into a single string for storage
     local data="$ip|$port|$username|$password|$ssh_key|$marzban_path|$db_container|$db_password|$bot_token|$chat_id"
     SERVERS[$server_name]="$data"
     save_config
@@ -159,42 +140,23 @@ perform_backup() {
     if [[ -n "$ssh_key" ]]; then
         ssh_cmd="ssh -i \"$ssh_key\" -p \"$port\" \"$username@$ip\""
     else
-        # Use sshpass, requires `sshpass` to be installed
         ssh_cmd="sshpass -p '$password' ssh -p \"$port\" \"$username@$ip\""
     fi
 
-    local backup_file_base="$server_backup_dir/marzban-backup-$current_timestamp"
-    
-    # 1. Backup Marzban files
-    echo "  - Backing up Marzban files..." | tee -a "$LOG_FILE"
-    if ! eval "$ssh_cmd \"sudo tar -czf - '$marzban_path'\" > \"$backup_file_base.tar.gz\""; then
-        echo "Error: Failed to back up Marzban files." | tee -a "$LOG_FILE"
-        return 1
-    fi
-    
-    # 2. Backup database
-    echo "  - Backing up database..." | tee -a "$LOG_FILE"
-    if ! eval "$ssh_cmd \"sudo docker exec $db_container mysqldump -u root -p'$db_password' --all-databases --single-transaction\" > \"$backup_file_base.sql\""; then
-        echo "Error: Failed to back up the database." | tee -a "$LOG_FILE"
-        return 1
-    fi
-    
-    # 3. Create final compressed archive
     local final_archive_file="$server_backup_dir/complete-backup-$current_timestamp.tar.gz"
-    echo "  - Compressing files into a single archive..." | tee -a "$LOG_FILE"
-    if ! tar -czf "$final_archive_file" "$backup_file_base.tar.gz" "$backup_file_base.sql"; then
+    
+    # Use a single, more efficient pipeline
+    echo "  - Creating backup archive..." | tee -a "$LOG_FILE"
+    if ! eval "$ssh_cmd \"sudo tar -czf - '$marzban_path' | cat - <(sudo docker exec $db_container mysqldump -u root -p'$db_password' --all-databases --single-transaction)\" > \"$final_archive_file\""; then
         echo "Error: Failed to create the final archive." | tee -a "$LOG_FILE"
         return 1
     fi
     
-    # 4. Clean up temporary files
-    rm -f "$backup_file_base.tar.gz" "$backup_file_base.sql"
-    
-    # 5. Clean up old backups
+    # Clean up old backups
     echo "  - Cleaning up backups older than $RETENTION_DAYS days..." | tee -a "$LOG_FILE"
     find "$server_backup_dir" -type f -name "*.tar.gz" -mtime +$RETENTION_DAYS -delete
     
-    # 6. Send to Telegram
+    # Send to Telegram
     echo "  - Sending backup to Telegram..." | tee -a "$LOG_FILE"
     if ! curl -s -o /dev/null -w "%{http_code}" -F chat_id="$chat_id" -F document=@"$final_archive_file" "https://api.telegram.org/bot$bot_token/sendDocument" | grep -q "200"; then
         echo "Warning: Failed to send backup to Telegram. Check your bot token and chat ID." | tee -a "$LOG_FILE"
@@ -229,7 +191,6 @@ setup_cron() {
     local script_path="$(pwd)/mrbm.sh"
     local cron_command="$cron_schedule $script_path --all"
     
-    # Add or update the cron job
     (crontab -l 2>/dev/null | grep -v "$script_path" || true; echo "$cron_command") | crontab -
     echo "Cron job scheduled for all servers."
     echo "Command: $cron_command"
@@ -258,7 +219,7 @@ view_status() {
     echo "To view logs, run: tail $LOG_FILE"
 }
 
-# --- Main Menu and Script Execution ---
+# Main Menu and Script Execution
 main_menu() {
     while true; do
         clear
@@ -280,14 +241,11 @@ main_menu() {
             *) echo "Invalid option. Please try again." ;;
         esac
         
-        # Pause after an action
         read -p "Press Enter to continue..."
     done
 }
 
-# Check for a command-line argument to run backups automatically
 if [[ "$1" == "--all" ]]; then
-    check_dependencies
     load_config
     if [[ ${#SERVERS[@]} -eq 0 ]]; then
         echo "No servers configured. Exiting."
@@ -300,7 +258,4 @@ if [[ "$1" == "--all" ]]; then
 fi
 
 # Initial setup and main loop
-check_dependencies
 load_config
-
-main_menu
